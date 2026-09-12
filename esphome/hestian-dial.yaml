@@ -1,0 +1,1032 @@
+# Hestian: M5Stack Dial thermostat (the brain).
+#
+# Hardware (see docs/wiring.md):
+#   M5Stack Dial v1.1 (ESP32-S3, no PSRAM, 8 MB flash)
+#   PORT.A (Grove, I2C, GPIO13 SDA / GPIO15 SCL, 5 V):
+#     BME680 breakout           temperature / humidity / pressure (gas heater OFF)
+#     PCF8574 I2C expander      drives the 4-channel opto-isolated relay board
+#   Relay board (active low): IN1 = Y (compressor), IN2 = O/B (reversing
+#   valve), IN3 = W2/E (aux + emergency heat strips), IN4 = G (blower).
+#
+# The HVAC is a HEAT PUMP with auxiliary electric heat (Emerson stat had
+# W2 / E / O/B / R / G / C / Y wired). Heating and cooling both run the
+# compressor (Y); the reversing valve (O/B) picks the direction; W2 adds the
+# strips as second stage when the heat pump falls behind; Emergency Heat
+# runs the strips alone. The "Reversing Valve" select sets O or B logic.
+#
+# Interaction:
+#   Twist            adjust the focused setpoint (heat or cool) in 1 degree steps
+#   Short press      toggle focus between the heat and cool setpoints
+#   Long press       cycle mode: heat_cool -> heat -> cool -> fan_only -> off
+#   Tap a setpoint   focus it; tap the mode word to cycle mode
+#
+# Every tuning parameter (deadbands, cycle timers, sensor offset, sensor source,
+# display timeout, units) is a config entity in Home Assistant. No web server on
+# this device: the S3 has no PSRAM and LVGL + WiFi already use most of the RAM.
+
+substitutions:
+  device_name: hestian-dial
+  friendly_name: Hestian
+  room: Hallway
+  project_role: dial
+  # Remote room temperatures imported from HA (used by the "Sensor Source" select).
+  remote1_temp_entity: sensor.hestian_remote_1_temperature
+  remote2_temp_entity: sensor.hestian_remote_2_temperature
+  bme680_address: "0x76"    # 0x77 on some breakouts; check the i2c scan log
+  pcf8574_address: "0x20"   # A0..A2 tied low; 0x38 on PCF8574A parts
+
+packages:
+  common: !include packages/common.yaml
+
+esp32:
+  board: m5stack-stamps3
+  variant: esp32s3
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+esphome:
+  platformio_options:
+    board_build.flash_mode: dio
+  on_boot:
+    priority: -100
+    then:
+      - script.execute: apply_thermostat_settings
+      - script.execute: wake_screen
+      - script.execute: refresh_ui
+
+# ESP-IDF on the S3 logs to the UART pins by default; route it to the USB-C port.
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+# ---------------------------------------------------------------------------
+# Buses
+# ---------------------------------------------------------------------------
+spi:
+  clk_pin: GPIO6
+  mosi_pin: GPIO5
+
+i2c:
+  - id: internal_i2c        # touch controller, RTC, NFC (only touch is used)
+    sda: GPIO11
+    scl: GPIO12
+    scan: false
+  - id: grove_i2c           # PORT.A: BME680 + PCF8574
+    sda: GPIO13
+    scl: GPIO15
+    scan: true
+    frequency: 100kHz
+
+pcf8574:
+  - id: io_expander
+    i2c_id: grove_i2c
+    address: ${pcf8574_address}
+
+# ---------------------------------------------------------------------------
+# Display, backlight, touch
+# ---------------------------------------------------------------------------
+output:
+  - platform: ledc
+    pin: GPIO9
+    id: backlight_pwm
+    frequency: 2000Hz
+  - platform: ledc
+    id: buzzer_pwm
+    pin:
+      number: GPIO3           # strapping pin, but it is the Dial's wired buzzer
+      ignore_strapping_warning: true
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    id: backlight
+    name: "Screen Backlight"
+    entity_category: config
+    restore_mode: ALWAYS_ON
+    default_transition_length: 300ms
+
+rtttl:
+  output: buzzer_pwm
+  id: buzzer
+
+display:
+  - platform: mipi_spi
+    id: dial_display
+    model: GC9A01A
+    cs_pin: GPIO7
+    dc_pin: GPIO4
+    reset_pin: GPIO8
+    invert_colors: true
+    dimensions:
+      width: 240
+      height: 240
+    update_interval: never
+    auto_clear_enabled: false
+
+touchscreen:
+  - platform: ft5x06
+    id: dial_touch
+    i2c_id: internal_i2c
+    address: 0x38
+    on_touch:
+      - script.execute: wake_screen
+
+# ---------------------------------------------------------------------------
+# Inputs: encoder ring and center button
+# ---------------------------------------------------------------------------
+sensor:
+  - platform: rotary_encoder
+    id: dial_encoder
+    internal: true
+    pin_a:
+      number: GPIO40
+      mode:
+        input: true
+        pullup: true
+    pin_b:
+      number: GPIO41
+      mode:
+        input: true
+        pullup: true
+    resolution: 1
+    on_clockwise:
+      - script.execute:
+          id: nudge_setpoint
+          dir: 1
+    on_anticlockwise:
+      - script.execute:
+          id: nudge_setpoint
+          dir: -1
+
+  # -------------------------------------------------------------------------
+  # Local sensor: BME680 with the gas heater disabled. Without the heater it
+  # behaves like a BME280 and self-heats far less, which is what a thermostat
+  # wants. Offset is applied from the "Temperature Offset" config entity.
+  # -------------------------------------------------------------------------
+  - platform: bme680
+    i2c_id: grove_i2c
+    address: ${bme680_address}
+    update_interval: 10s
+    iir_filter: 3x
+    heater:
+    temperature:
+      id: local_temp
+      name: "${room} Temperature"
+      oversampling: 16x
+      filters:
+        - lambda: return x + id(temp_offset).state;
+        - sliding_window_moving_average:
+            window_size: 3
+            send_every: 1
+      on_value:
+        - script.execute: refresh_ui
+    humidity:
+      id: local_humidity
+      name: "${room} Humidity"
+      oversampling: 8x
+      on_value:
+        - script.execute: refresh_ui
+    pressure:
+      id: local_pressure
+      name: "${room} Pressure"
+      oversampling: 4x
+
+  # Remote room temperatures from the CYD units, via Home Assistant.
+  - platform: homeassistant
+    id: remote1_temp
+    entity_id: ${remote1_temp_entity}
+    filters:
+      # HA sends its display units; anything above 45 is Fahrenheit.
+      - lambda: |-
+          return x > 45.0f ? (x - 32.0f) * 5.0f / 9.0f : x;
+  - platform: homeassistant
+    id: remote2_temp
+    entity_id: ${remote2_temp_entity}
+    filters:
+      - lambda: |-
+          return x > 45.0f ? (x - 32.0f) * 5.0f / 9.0f : x;
+
+  # The temperature the thermostat regulates on. Which source feeds it is
+  # chosen by the "Sensor Source" select. Falls back to the local sensor when
+  # a remote is stale or unavailable.
+  - platform: template
+    id: control_temp
+    name: "Control Temperature"
+    unit_of_measurement: "°C"
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 10s
+    lambda: |-
+      const float local = id(local_temp).state;
+      const float r1 = id(remote1_temp).state;
+      const float r2 = id(remote2_temp).state;
+      const bool r1_ok = !std::isnan(r1) && r1 > -30.0f;
+      const bool r2_ok = !std::isnan(r2) && r2 > -30.0f;
+      const std::string src = id(sensor_source).current_option().str();
+      if (src == "Remote 1" && r1_ok) return r1;
+      if (src == "Remote 2" && r2_ok) return r2;
+      if (src == "Average") {
+        float sum = 0; int n = 0;
+        if (!std::isnan(local)) { sum += local; n++; }
+        if (r1_ok) { sum += r1; n++; }
+        if (r2_ok) { sum += r2; n++; }
+        if (n > 0) return sum / n;
+      }
+      return local;
+
+binary_sensor:
+  - platform: gpio
+    id: dial_button
+    internal: true
+    pin:
+      number: GPIO42
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 20ms
+      - delayed_off: 20ms
+    on_multi_click:
+      # Short press: toggle which setpoint the ring adjusts.
+      - timing:
+          - ON for at most 600ms
+          - OFF for at least 100ms
+        then:
+          - script.execute: wake_screen
+          - lambda: id(focus_cool) = !id(focus_cool);
+          - script.execute: refresh_ui
+      # Long press: cycle the HVAC mode.
+      - timing:
+          - ON for at least 700ms
+        then:
+          - script.execute: wake_screen
+          - script.execute: cycle_mode
+
+# ---------------------------------------------------------------------------
+# Relays (through the PCF8574). Exposed as diagnostic switches so the bench
+# test can click each one from HA. Do not toggle these by hand once the
+# thermostat is live; it will fight you.
+# ---------------------------------------------------------------------------
+switch:
+  - platform: gpio
+    id: relay_y
+    name: "Relay Compressor (Y)"
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
+    pin:
+      pcf8574: io_expander
+      number: 0
+      mode:
+        output: true
+      inverted: true
+  - platform: gpio
+    id: relay_ob
+    name: "Relay Reversing Valve OB"
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
+    pin:
+      pcf8574: io_expander
+      number: 1
+      mode:
+        output: true
+      inverted: true
+  - platform: gpio
+    id: relay_aux
+    name: "Relay Aux Heat W2"
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
+    pin:
+      pcf8574: io_expander
+      number: 2
+      mode:
+        output: true
+      inverted: true
+  - platform: gpio
+    id: relay_fan
+    name: "Relay Fan (G)"
+    entity_category: diagnostic
+    restore_mode: ALWAYS_OFF
+    pin:
+      pcf8574: io_expander
+      number: 3
+      mode:
+        output: true
+      inverted: true
+
+  # Behaviour toggles (config entities in HA).
+  - platform: template
+    id: emergency_heat
+    name: "Emergency Heat"
+    icon: mdi:radiator
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    on_turn_on:
+      - script.execute: reassert_action
+      - script.execute: refresh_ui
+    on_turn_off:
+      - script.execute: reassert_action
+      - script.execute: refresh_ui
+  - platform: template
+    id: click_sound
+    name: "Encoder Click Sound"
+    icon: mdi:volume-high
+    entity_category: config
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+
+# ---------------------------------------------------------------------------
+# The thermostat
+# ---------------------------------------------------------------------------
+climate:
+  - platform: thermostat
+    id: hvac
+    name: "Thermostat"
+    sensor: control_temp
+    humidity_sensor: local_humidity
+    visual:
+      min_temperature: 10 °C
+      max_temperature: 32 °C
+      temperature_step:
+        target_temperature: 0.5
+        current_temperature: 0.1
+
+    # Compile-time defaults. The config entities below override these at
+    # boot and whenever they change, so tune from HA, not here.
+    set_point_minimum_differential: 1.0 °C
+    heat_deadband: 0.3 °C
+    heat_overrun: 0.3 °C
+    cool_deadband: 0.3 °C
+    cool_overrun: 0.3 °C
+    # Heat and cool both run the compressor, so both get compressor timers.
+    min_heating_off_time: 300s
+    min_heating_run_time: 300s
+    min_cooling_off_time: 300s
+    min_cooling_run_time: 300s
+    # Aux strips join in when the room is this far below the heat setpoint,
+    # or once the compressor alone has been heating this long.
+    supplemental_heating_delta: 1.5 °C
+    max_heating_run_time: 3600s
+    min_fanning_off_time: 30s
+    min_fanning_run_time: 30s
+    min_idle_time: 30s
+    startup_delay: true
+
+    default_preset: Home
+    on_boot_restore_from: memory
+    preset:
+      - name: Home
+        default_target_temperature_low: 20.0 °C    # 68 F
+        default_target_temperature_high: 24.5 °C   # 76 F
+        mode: heat_cool
+      - name: Away
+        default_target_temperature_low: 16.5 °C    # 62 F
+        default_target_temperature_high: 28.0 °C   # 82 F
+        mode: heat_cool
+      - name: Sleep
+        default_target_temperature_low: 18.5 °C    # 65 F
+        default_target_temperature_high: 23.0 °C   # 73 F
+        mode: heat_cool
+
+    heat_cool_mode:
+      - script.execute: refresh_ui
+    heat_mode:
+      - script.execute: refresh_ui
+    cool_mode:
+      - script.execute: refresh_ui
+    fan_only_mode:
+      - script.execute: refresh_ui
+    off_mode:
+      - switch.turn_off: relay_ob
+      - script.execute: refresh_ui
+
+    heat_action:
+      - script.execute:
+          id: set_valve
+          cooling: false
+      - if:
+          condition:
+            switch.is_on: emergency_heat
+          then:
+            - switch.turn_off: relay_y
+            - switch.turn_on: relay_aux
+          else:
+            - switch.turn_on: relay_y
+      - switch.turn_on: relay_fan
+    supplemental_heating_action:
+      - switch.turn_on: relay_aux
+    cool_action:
+      - switch.turn_off: relay_aux
+      - script.execute:
+          id: set_valve
+          cooling: true
+      - switch.turn_on: relay_y
+      - switch.turn_on: relay_fan
+    fan_only_action:
+      - switch.turn_off: relay_y
+      - switch.turn_off: relay_aux
+      - switch.turn_on: relay_fan
+    idle_action:
+      - switch.turn_off: relay_y
+      - switch.turn_off: relay_aux
+      # Reversing valve is left where it is between calls (no clunk per cycle).
+      - if:
+          condition:
+            lambda: return id(hvac).fan_mode != climate::CLIMATE_FAN_ON;
+          then:
+            - switch.turn_off: relay_fan
+
+    # Fan mode "on" keeps the blower running through idle; "auto" lets the
+    # idle action drop it.
+    min_fan_mode_switching_time: 30s
+    fan_mode_on_action:
+      - switch.turn_on: relay_fan
+    fan_mode_auto_action:
+      - if:
+          condition:
+            lambda: |-
+              return id(hvac).action == climate::CLIMATE_ACTION_IDLE ||
+                     id(hvac).action == climate::CLIMATE_ACTION_OFF;
+          then:
+            - switch.turn_off: relay_fan
+
+    on_state:
+      - script.execute: refresh_ui
+
+# ---------------------------------------------------------------------------
+# Settings surface: config entities in Home Assistant
+# ---------------------------------------------------------------------------
+number:
+  - platform: template
+    id: temp_offset
+    name: "Temperature Offset"
+    icon: mdi:thermometer-plus
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: -5
+    max_value: 5
+    step: 0.1
+    initial_value: 0
+    optimistic: true
+    restore_value: true
+    mode: box
+
+  - platform: template
+    id: setpoint_min_diff
+    name: "Setpoint Minimum Gap"
+    icon: mdi:arrow-expand-vertical
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0.5
+    max_value: 5
+    step: 0.1
+    initial_value: 1.0
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_set_point_minimum_differential(x);
+
+  - platform: template
+    id: heat_deadband
+    name: "Heat Deadband"
+    icon: mdi:fire
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0.1
+    max_value: 3
+    step: 0.1
+    initial_value: 0.3
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_heat_deadband(x);
+  - platform: template
+    id: heat_overrun
+    name: "Heat Overrun"
+    icon: mdi:fire
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0.1
+    max_value: 3
+    step: 0.1
+    initial_value: 0.3
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_heat_overrun(x);
+  - platform: template
+    id: cool_deadband
+    name: "Cool Deadband"
+    icon: mdi:snowflake
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0.1
+    max_value: 3
+    step: 0.1
+    initial_value: 0.3
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_cool_deadband(x);
+  - platform: template
+    id: cool_overrun
+    name: "Cool Overrun"
+    icon: mdi:snowflake
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0.1
+    max_value: 3
+    step: 0.1
+    initial_value: 0.3
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_cool_overrun(x);
+
+  - platform: template
+    id: min_heat_run
+    name: "Min Heat Run Time"
+    icon: mdi:timer-play
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 1800
+    step: 30
+    initial_value: 180
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_heating_minimum_run_time_in_sec((uint32_t) x);
+  - platform: template
+    id: min_heat_off
+    name: "Min Heat Off Time"
+    icon: mdi:timer-pause
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 1800
+    step: 30
+    initial_value: 300
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_heating_minimum_off_time_in_sec((uint32_t) x);
+  - platform: template
+    id: min_cool_run
+    name: "Min Cool Run Time"
+    icon: mdi:timer-play
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 1800
+    step: 30
+    initial_value: 300
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_cooling_minimum_run_time_in_sec((uint32_t) x);
+  - platform: template
+    id: min_cool_off
+    name: "Min Cool Off Time"
+    icon: mdi:timer-pause
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 1800
+    step: 30
+    initial_value: 300
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_cooling_minimum_off_time_in_sec((uint32_t) x);
+  - platform: template
+    id: min_idle
+    name: "Min Idle Time"
+    icon: mdi:timer-sand
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 0
+    max_value: 900
+    step: 10
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_idle_minimum_time_in_sec((uint32_t) x);
+
+  - platform: template
+    id: aux_heat_delta
+    name: "Aux Heat Delta"
+    icon: mdi:radiator
+    entity_category: config
+    unit_of_measurement: "°C"
+    min_value: 0.5
+    max_value: 5
+    step: 0.1
+    initial_value: 1.5
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_supplemental_heat_delta(x);
+  - platform: template
+    id: max_compressor_heat_run
+    name: "Max Compressor Heat Run Before Aux"
+    icon: mdi:timer-alert
+    entity_category: config
+    unit_of_measurement: "min"
+    min_value: 10
+    max_value: 240
+    step: 5
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - lambda: id(hvac).set_heating_maximum_run_time_in_sec((uint32_t) (x * 60));
+
+  - platform: template
+    id: screen_timeout
+    name: "Screen Timeout"
+    icon: mdi:monitor-off
+    entity_category: config
+    unit_of_measurement: "s"
+    min_value: 5
+    max_value: 600
+    step: 5
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    mode: box
+  - platform: template
+    id: screen_brightness
+    name: "Screen Brightness"
+    icon: mdi:brightness-6
+    entity_category: config
+    unit_of_measurement: "%"
+    min_value: 10
+    max_value: 100
+    step: 5
+    initial_value: 80
+    optimistic: true
+    restore_value: true
+    mode: slider
+    on_value:
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda return x / 100.0f;
+
+select:
+  - platform: template
+    id: reversing_valve
+    name: "Reversing Valve"
+    icon: mdi:valve
+    entity_category: config
+    options: ["O (energized to cool)", "B (energized to heat)"]
+    initial_option: "O (energized to cool)"
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: sensor_source
+    name: "Sensor Source"
+    icon: mdi:thermometer-check
+    entity_category: config
+    options: ["Dial", "Remote 1", "Remote 2", "Average"]
+    initial_option: "Dial"
+    optimistic: true
+    restore_value: true
+  - platform: template
+    id: display_units
+    name: "Display Units"
+    icon: mdi:temperature-fahrenheit
+    entity_category: config
+    options: ["°F", "°C"]
+    initial_option: "°F"
+    optimistic: true
+    restore_value: true
+    on_value:
+      - script.execute: refresh_ui
+
+# ---------------------------------------------------------------------------
+# State and scripts
+# ---------------------------------------------------------------------------
+globals:
+  - id: focus_cool          # false = ring edits the heat setpoint, true = cool
+    type: bool
+    initial_value: "false"
+  - id: editing
+    type: bool
+    initial_value: "false"
+  - id: pending_low
+    type: float
+    initial_value: "20.0"
+  - id: pending_high
+    type: float
+    initial_value: "24.5"
+
+script:
+  - id: apply_thermostat_settings
+    then:
+      - lambda: |-
+          id(hvac).set_set_point_minimum_differential(id(setpoint_min_diff).state);
+          id(hvac).set_heat_deadband(id(heat_deadband).state);
+          id(hvac).set_heat_overrun(id(heat_overrun).state);
+          id(hvac).set_cool_deadband(id(cool_deadband).state);
+          id(hvac).set_cool_overrun(id(cool_overrun).state);
+          id(hvac).set_heating_minimum_run_time_in_sec((uint32_t) id(min_heat_run).state);
+          id(hvac).set_heating_minimum_off_time_in_sec((uint32_t) id(min_heat_off).state);
+          id(hvac).set_cooling_minimum_run_time_in_sec((uint32_t) id(min_cool_run).state);
+          id(hvac).set_cooling_minimum_off_time_in_sec((uint32_t) id(min_cool_off).state);
+          id(hvac).set_idle_minimum_time_in_sec((uint32_t) id(min_idle).state);
+          id(hvac).set_supplemental_heat_delta(id(aux_heat_delta).state);
+          id(hvac).set_heating_maximum_run_time_in_sec((uint32_t) (id(max_compressor_heat_run).state * 60));
+
+  # Drive the reversing valve for the requested direction, honouring O vs B.
+  - id: set_valve
+    parameters:
+      cooling: bool
+    then:
+      - lambda: |-
+          const bool o_type = id(reversing_valve).current_option() == "O (energized to cool)";
+          const bool energize = o_type ? cooling : !cooling;
+          if (energize) id(relay_ob).turn_on(); else id(relay_ob).turn_off();
+
+  # Emergency Heat toggled mid-call: re-run the current action's outputs.
+  - id: reassert_action
+    then:
+      - lambda: |-
+          if (id(hvac).action != climate::CLIMATE_ACTION_HEATING) return;
+          if (id(emergency_heat).state) {
+            id(relay_y).turn_off();
+            id(relay_aux).turn_on();
+          } else {
+            id(relay_y).turn_on();
+            // Aux stays on only if the thermostat's supplemental stage asked for it;
+            // it will re-engage on the next evaluation if still needed.
+            id(relay_aux).turn_off();
+          }
+
+  - id: wake_screen
+    mode: restart
+    then:
+      - lvgl.resume:
+      - light.turn_on:
+          id: backlight
+          brightness: !lambda return id(screen_brightness).state / 100.0f;
+
+  # Ring turned one detent. Adjust the focused setpoint by one display degree
+  # and commit after the ring stops moving.
+  - id: nudge_setpoint
+    mode: queued
+    parameters:
+      dir: int
+    then:
+      - script.execute: wake_screen
+      - if:
+          condition:
+            switch.is_on: click_sound
+          then:
+            - rtttl.play: "click:d=32,o=7,b=400:c"
+      - lambda: |-
+          const bool fahrenheit = id(display_units).current_option() == "°F";
+          const float step = fahrenheit ? (5.0f / 9.0f) : 0.5f;
+          const float gap = id(setpoint_min_diff).state;
+          const float lo_lim = 10.0f, hi_lim = 32.0f;
+          if (!id(editing)) {
+            id(pending_low) = id(hvac).target_temperature_low;
+            id(pending_high) = id(hvac).target_temperature_high;
+            id(editing) = true;
+          }
+          // Single-setpoint modes edit whichever point that mode uses.
+          bool edit_cool = id(focus_cool);
+          if (id(hvac).mode == climate::CLIMATE_MODE_HEAT) edit_cool = false;
+          if (id(hvac).mode == climate::CLIMATE_MODE_COOL) edit_cool = true;
+          if (edit_cool) {
+            float v = id(pending_high) + dir * step;
+            v = std::max(v, id(pending_low) + gap);
+            id(pending_high) = std::min(std::max(v, lo_lim), hi_lim);
+          } else {
+            float v = id(pending_low) + dir * step;
+            v = std::min(v, id(pending_high) - gap);
+            id(pending_low) = std::min(std::max(v, lo_lim), hi_lim);
+          }
+      - script.execute: refresh_ui
+      - script.execute: commit_setpoints
+
+  - id: commit_setpoints
+    mode: restart
+    then:
+      - delay: 900ms
+      - climate.control:
+          id: hvac
+          target_temperature_low: !lambda return id(pending_low);
+          target_temperature_high: !lambda return id(pending_high);
+      - lambda: id(editing) = false;
+      - script.execute: refresh_ui
+
+  - id: cycle_mode
+    then:
+      - lambda: |-
+          auto call = id(hvac).make_call();
+          switch (id(hvac).mode) {
+            case climate::CLIMATE_MODE_HEAT_COOL: call.set_mode(climate::CLIMATE_MODE_HEAT); break;
+            case climate::CLIMATE_MODE_HEAT:      call.set_mode(climate::CLIMATE_MODE_COOL); break;
+            case climate::CLIMATE_MODE_COOL:      call.set_mode(climate::CLIMATE_MODE_FAN_ONLY); break;
+            case climate::CLIMATE_MODE_FAN_ONLY:  call.set_mode(climate::CLIMATE_MODE_OFF); break;
+            default:                              call.set_mode(climate::CLIMATE_MODE_HEAT_COOL); break;
+          }
+          call.perform();
+
+  # Redraw every widget from current state. Cheap enough to call liberally.
+  - id: refresh_ui
+    mode: restart
+    then:
+      - lambda: |-
+          const bool f = id(display_units).current_option() == "°F";
+          auto disp = [f](float c) { return f ? c * 9.0f / 5.0f + 32.0f : c; };
+          const float cur = id(control_temp).state;
+          const float lo = id(editing) ? id(pending_low) : id(hvac).target_temperature_low;
+          const float hi = id(editing) ? id(pending_high) : id(hvac).target_temperature_high;
+
+          char buf[16];
+          if (std::isnan(cur)) {
+            lv_label_set_text(id(lbl_temp), "--");
+          } else {
+            snprintf(buf, sizeof(buf), f ? "%.0f°" : "%.1f°", disp(cur));
+            lv_label_set_text(id(lbl_temp), buf);
+            lv_arc_set_value(id(temp_arc), (int) roundf(cur * 10.0f));
+          }
+          snprintf(buf, sizeof(buf), f ? "%.0f" : "%.1f", disp(lo));
+          lv_label_set_text(id(lbl_heat), buf);
+          snprintf(buf, sizeof(buf), f ? "%.0f" : "%.1f", disp(hi));
+          lv_label_set_text(id(lbl_cool), buf);
+
+          if (!std::isnan(id(local_humidity).state)) {
+            snprintf(buf, sizeof(buf), "%.0f%% RH", id(local_humidity).state);
+            lv_label_set_text(id(lbl_hum), buf);
+          }
+
+          const char *mode_txt = "OFF";
+          switch (id(hvac).mode) {
+            case climate::CLIMATE_MODE_HEAT_COOL: mode_txt = id(emergency_heat).state ? "AUTO EM" : "AUTO"; break;
+            case climate::CLIMATE_MODE_HEAT:      mode_txt = id(emergency_heat).state ? "EM HEAT" : "HEAT"; break;
+            case climate::CLIMATE_MODE_COOL:      mode_txt = "COOL"; break;
+            case climate::CLIMATE_MODE_FAN_ONLY:  mode_txt = "FAN"; break;
+            default: break;
+          }
+          const char *act_txt = "";
+          lv_color_t arc_col = lv_color_hex(0x606060);
+          switch (id(hvac).action) {
+            case climate::CLIMATE_ACTION_HEATING:
+              act_txt = id(relay_aux).state ? "HEATING + AUX" : "HEATING";
+              arc_col = lv_color_hex(0xFF6A00); break;
+            case climate::CLIMATE_ACTION_COOLING: act_txt = "COOLING"; arc_col = lv_color_hex(0x2A9DFF); break;
+            case climate::CLIMATE_ACTION_FAN:     act_txt = "FAN";     arc_col = lv_color_hex(0x7ED957); break;
+            case climate::CLIMATE_ACTION_IDLE:    act_txt = "IDLE";    break;
+            default: break;
+          }
+          lv_label_set_text(id(lbl_mode), mode_txt);
+          lv_label_set_text(id(lbl_action), act_txt);
+          lv_obj_set_style_arc_color(id(temp_arc), arc_col, LV_PART_INDICATOR);
+
+          // Focus ring on the setpoint the encoder is editing.
+          bool cool_focus = id(focus_cool);
+          if (id(hvac).mode == climate::CLIMATE_MODE_HEAT) cool_focus = false;
+          if (id(hvac).mode == climate::CLIMATE_MODE_COOL) cool_focus = true;
+          lv_obj_set_style_border_opa(id(box_heat), cool_focus ? LV_OPA_20 : LV_OPA_COVER, LV_PART_MAIN);
+          lv_obj_set_style_border_opa(id(box_cool), cool_focus ? LV_OPA_COVER : LV_OPA_20, LV_PART_MAIN);
+          const bool off = id(hvac).mode == climate::CLIMATE_MODE_OFF || id(hvac).mode == climate::CLIMATE_MODE_FAN_ONLY;
+          lv_obj_set_style_opa(id(box_heat), off ? LV_OPA_30 : LV_OPA_COVER, LV_PART_MAIN);
+          lv_obj_set_style_opa(id(box_cool), off ? LV_OPA_30 : LV_OPA_COVER, LV_PART_MAIN);
+
+# ---------------------------------------------------------------------------
+# UI (LVGL, 240x240 round)
+# ---------------------------------------------------------------------------
+lvgl:
+  displays:
+    - dial_display
+  touchscreens:
+    - dial_touch
+  buffer_size: 25%
+  color_depth: 16
+  on_idle:
+    timeout: !lambda return (uint32_t) (id(screen_timeout).state * 1000);
+    then:
+      - light.turn_off: backlight
+      - lvgl.pause:
+  pages:
+    - id: main_page
+      bg_color: 0x000000
+      widgets:
+        - arc:
+            id: temp_arc
+            align: CENTER
+            width: 238
+            height: 238
+            min_value: 100          # 10.0 C
+            max_value: 320          # 32.0 C
+            value: 210
+            start_angle: 135
+            end_angle: 45
+            adjustable: false
+            arc_width: 8
+            arc_color: 0x1E1E1E
+            arc_rounded: true
+            indicator:
+              arc_width: 8
+              arc_color: 0x606060
+              arc_rounded: true
+            knob:
+              bg_opa: TRANSP
+        - label:
+            id: lbl_mode
+            align: TOP_MID
+            y: 26
+            text: "AUTO"
+            text_color: 0xB0B0B0
+            text_font: montserrat_16
+            clickable: true
+            on_click:
+              - script.execute: wake_screen
+              - script.execute: cycle_mode
+        - label:
+            id: lbl_action
+            align: TOP_MID
+            y: 46
+            text: ""
+            text_color: 0x808080
+            text_font: montserrat_12
+        - label:
+            id: lbl_temp
+            align: CENTER
+            y: -10
+            text: "--"
+            text_color: 0xFFFFFF
+            text_font: montserrat_48
+        - label:
+            id: lbl_hum
+            align: CENTER
+            y: 30
+            text: ""
+            text_color: 0x808080
+            text_font: montserrat_14
+        - obj:
+            id: box_heat
+            align: BOTTOM_MID
+            x: -44
+            y: -34
+            width: 74
+            height: 40
+            radius: 20
+            bg_color: 0x2A1200
+            border_width: 2
+            border_color: 0xFF6A00
+            pad_all: 0
+            clickable: true
+            on_click:
+              - script.execute: wake_screen
+              - lambda: id(focus_cool) = false;
+              - script.execute: refresh_ui
+            widgets:
+              - label:
+                  id: lbl_heat
+                  align: CENTER
+                  text: "68"
+                  text_color: 0xFF8A33
+                  text_font: montserrat_22
+        - obj:
+            id: box_cool
+            align: BOTTOM_MID
+            x: 44
+            y: -34
+            width: 74
+            height: 40
+            radius: 20
+            bg_color: 0x001A2E
+            border_width: 2
+            border_color: 0x2A9DFF
+            pad_all: 0
+            clickable: true
+            on_click:
+              - script.execute: wake_screen
+              - lambda: id(focus_cool) = true;
+              - script.execute: refresh_ui
+            widgets:
+              - label:
+                  id: lbl_cool
+                  align: CENTER
+                  text: "76"
+                  text_color: 0x5CB8FF
+                  text_font: montserrat_22

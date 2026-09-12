@@ -1,0 +1,88 @@
+# Starter Lovelace view for Hestian. Paste into a dashboard in YAML mode.
+title: Hestian
+views:
+  - title: Climate
+    path: hestian
+    cards:
+      - type: thermostat
+        entity: climate.hestian_thermostat
+        name: Hestian
+        features:
+          - type: climate-hvac-modes
+            hvac_modes:
+              - heat_cool
+              - heat
+              - cool
+              - fan_only
+              - "off"
+          - type: climate-preset-modes
+            style: dropdown
+
+      - type: entities
+        title: Rooms
+        entities:
+          - type: section
+            label: Hallway (Dial)
+          - entity: sensor.hestian_hallway_temperature
+            name: Temperature
+          - entity: sensor.hestian_hallway_humidity
+            name: Humidity
+          - entity: sensor.hestian_control_temperature
+            name: Control temperature
+          - type: section
+            label: Living Room
+          - entity: sensor.hestian_remote_1_temperature
+            name: Temperature
+          - entity: sensor.hestian_remote_1_humidity
+            name: Humidity
+          - entity: sensor.hestian_remote_1_co2
+            name: CO2
+          - entity: sensor.hestian_remote_1_air_quality
+            name: Air quality
+          - entity: sensor.hestian_remote_1_pressure
+            name: Pressure
+          - type: section
+            label: Bedroom
+          - entity: sensor.hestian_remote_2_temperature
+            name: Temperature
+          - entity: sensor.hestian_remote_2_humidity
+            name: Humidity
+          - entity: sensor.hestian_remote_2_co2
+            name: CO2
+          - entity: sensor.hestian_remote_2_air_quality
+            name: Air quality
+          - entity: sensor.hestian_remote_2_pressure
+            name: Pressure
+
+      - type: history-graph
+        title: Last 24 h
+        hours_to_show: 24
+        entities:
+          - climate.hestian_thermostat
+          - sensor.hestian_hallway_temperature
+          - sensor.hestian_remote_1_temperature
+          - sensor.hestian_remote_2_temperature
+
+      - type: entities
+        title: Thermostat settings
+        state_color: false
+        entities:
+          - select.hestian_sensor_source
+          - number.hestian_temperature_offset
+          - number.hestian_setpoint_minimum_gap
+          - number.hestian_heat_deadband
+          - number.hestian_heat_overrun
+          - number.hestian_cool_deadband
+          - number.hestian_cool_overrun
+          - number.hestian_min_heat_run_time
+          - number.hestian_min_heat_off_time
+          - number.hestian_min_cool_run_time
+          - number.hestian_min_cool_off_time
+          - number.hestian_min_idle_time
+          - select.hestian_reversing_valve
+          - number.hestian_aux_heat_delta
+          - number.hestian_max_compressor_heat_run_before_aux
+          - switch.hestian_emergency_heat
+          - select.hestian_display_units
+          - number.hestian_screen_timeout
+          - number.hestian_screen_brightness

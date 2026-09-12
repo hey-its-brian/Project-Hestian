@@ -1,0 +1,19 @@
+# Hestian remote unit 2. All logic lives in packages/remote-cyd.yaml;
+# this file only names the device and its room.
+substitutions:
+  device_name: hestian-remote-2
+  friendly_name: Hestian Remote 2
+  room: Bedroom
+  room_label: BEDROOM
+  project_role: remote
+  thermostat_entity: climate.hestian_thermostat
+  # 2-USB CYD boards ship with either an ST7789V or an ILI9342 panel.
+  # If the screen is blank or mirrored, switch to ESP32-2432S028-9342.
+  display_model: ESP32-2432S028-7789
+  bme680_address: "0x77"    # or 0x76; check the i2c scan log
+  units_label: "°F"         # what HA reports the thermostat in
+  setpoint_step: "1.0"      # one degree in those units per button press
+
+packages:
+  common: !include packages/common.yaml
+  remote: !include packages/remote-cyd.yaml
