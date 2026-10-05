@@ -8,71 +8,97 @@
 
 ## 1. Dial thermostat
 
-### Parts
+Two firmware variants share the same sensor, display, knob and menu:
 
-- M5Stack Dial v1.1
-- BME680 breakout (I2C)
-- PCF8574 I2C expander breakout (address 0x20 with A0..A2 low)
-- 4-channel opto-isolated 5 V relay module (active low inputs); all four
-  channels are used
-- Grove cable with one end cut to bare leads, or a Grove-to-Dupont cable
-- 5 V USB-C supply for the Dial (bench and wall)
+| File | System | Relay drive | Status |
+|---|---|---|---|
+| `esphome/hestian-dial-heatpump.yaml` | Heat pump + aux strips (this apartment) | MCP23017 on PORT.A, 4 relays | Validated, not yet hardware tested |
+| `esphome/hestian-dial-conventional.yaml` | Furnace / air handler W + AC on Y | PORT.B GPIO1/2 direct, 2 relays | Bench tested 2026-10-04 |
 
-### Grove PORT.A pinout (looking at the Dial's port)
+`esphome/hestian-dial-lvgl-draft.yaml` is the superseded 2026-09-12 draft and
+is not for flashing (its PORT.A pins and parts are wrong).
 
-| Grove pin | Signal | GPIO |
-|---|---|---|
-| 1 (yellow) | SCL | GPIO15 |
-| 2 (white) | SDA | GPIO13 |
-| 3 (red) | 5 V | |
-| 4 (black) | GND | |
+### Pins confirmed on the bench (2026-10-04)
 
-PORT.A carries 5 V, not 3.3 V. Both the BME680 breakout and the PCF8574
-breakout tolerate 5 V supply on their VIN pins (they have onboard regulators
-or are 5 V parts). The I2C lines idle at 3.3 V from the Dial's pull-ups; the
-PCF8574 is fine with that, and the BME680 breakout's level shifter handles it.
+M5Stack's Grove colours did not match the expected GPIOs on either port.
+Always confirm in software.
 
-### I2C bus (all in parallel on PORT.A)
+| Port | Wire | GPIO | Role |
+|---|---|---|---|
+| PORT.A | red / black | | 5 V / GND |
+| PORT.A | | **GPIO15** | **SDA** |
+| PORT.A | | **GPIO13** | **SCL** |
+| PORT.B | red / black | | 5 V / GND |
+| PORT.B | white | GPIO1 | relay IN1 (conventional build) |
+| PORT.B | yellow | GPIO2 | relay IN2 (conventional build) |
+
+Both Grove ports supply **5 V only**. The Dial's I2C pins are not 5 V
+tolerant, so everything on PORT.A runs from a buck converter set to 3.3 V
+(measure it before connecting anything; adjustable modules often ship set
+high).
+
+### Relay board
+
+DZS Elec 4-channel opto-isolated board, 5 V coils, powered from a Grove 5 V
+rail. Set each used channel's trigger jumper to **H** (high-level trigger):
+3.3 V turns the relay on, 0 V turns it off, and a booting Dial holds it off.
+No `inverted: true` in the firmware.
+
+### Heat pump build (MCP23017)
+
+Parts: SCD40 breakout with onboard pull-ups, Waveshare MCP23017 I/O
+expansion board, 5 V to 3.3 V buck, relay board, Grove-to-Dupont cables.
 
 ```
-Dial PORT.A          BME680           PCF8574
-  SCL  ------------- SCL ------------ SCL
-  SDA  ------------- SDA ------------ SDA
-  5V   ------------- VIN ------------ VCC
-  GND  ------------- GND ------------ GND
-                                       A0, A1, A2 -> GND   (address 0x20)
+Dial PORT.A                         3.3 V rail / I2C bus
+  red 5V  ----- buck IN+   buck OUT+ ---+---- SCD40 VCC
+  black GND --- buck IN-   buck OUT- ---+---- SCD40 GND ---- MCP23017 GND
+                                        +---------------------- MCP23017 VCC
+  GPIO15 (SDA) ---------------------------- SCD40 SDA ------ MCP23017 SDA
+  GPIO13 (SCL) ---------------------------- SCD40 SCL ------ MCP23017 SCL
+
+MCP23017          Relay board (all four jumpers on H)
+  GPA0 ---------- IN1   Y    compressor (heat and cool)
+  GPA1 ---------- IN2   O/B  reversing valve
+  GPA2 ---------- IN3   W2/E aux and emergency heat strips
+  GPA3 ---------- IN4   G    blower
+
+Dial PORT.B red 5V / black GND ---- relay VCC / GND
 ```
 
-Keep the run from the Dial to the BME680 short and mount the sensor below
-the Dial in a vented pocket. The Dial's display and radio warm its body by a
-degree or two; the sensor must not sit in that plume.
+Grounds must be common (non-isolated buck: IN- and OUT- are the same net).
+The MCP23017 address is set in the firmware (0x27 assumed for the Waveshare
+board); use whatever the boot log's I2C scan reports. Its pins float as
+inputs for a moment at power-up: if any relay chatters at boot, add 10 kΩ
+pull-downs from IN1 to IN4 to GND.
 
-### PCF8574 to relay board
+The MCP23017 replaces the PCF8574 from the 2026-09-12 plan: the PCF8574 can
+only sink current, which would force active-low relays at 5 V logic and put
+5 V on the Dial's I2C pins. The MCP23017 has push-pull outputs and runs at
+3.3 V.
+
+### Conventional build (direct GPIO)
 
 ```
-PCF8574        Relay board
-  P0  -------- IN1   (Y, compressor)
-  P1  -------- IN2   (O/B, reversing valve)
-  P2  -------- IN3   (W2/E, aux and emergency heat strips)
-  P3  -------- IN4   (G, blower)
-  VCC -------- VCC   (5 V, shared from PORT.A)
-  GND -------- GND
-```
+Dial PORT.B                Relay board (jumpers 1 and 2 on H)
+  white  GPIO1 ----------- IN1   W  heat
+  yellow GPIO2 ----------- IN2   Y  cool (add G here if the blower does not
+                                       start on Y by itself)
+  red    5V    ----------- VCC
+  black  GND   ----------- GND
 
-The PCF8574's outputs are weak high, strong low. That pairs correctly with
-an active-low relay board: the expander sinks current to pull an input low
-and energise a relay. At power-up every PCF8574 pin is high, so all relays
-start off. ESPHome sets `inverted: true` on each switch so "on" in HA means
-"relay closed".
+Dial PORT.A -> buck (3.3 V) -> SCD40, SDA GPIO15, SCL GPIO13 (as above)
+```
 
 ### 24 VAC side (air handler powered OFF)
 
-The system is a **heat pump with auxiliary electric heat**. The old Emerson
-thermostat had these wired: W2 (white), E, O/B (orange), R (red), G
-(green), C (blue), Y (yellow). Confirm each colour against its terminal as
-you remove them and label them.
+> **Before touching the HVAC side:** shorting R to C blows the air handler's
+> low-voltage fuse. Kill the air handler at its switch or breaker first.
+> Use COM + NO on each relay so every circuit is open at rest.
 
-Use COM + NO on each relay so every circuit is open at rest.
+**Heat pump (this apartment).** Old Emerson stat: W2 (white), E, O/B
+(orange), R (red), G (green), C (blue), Y (yellow). Label each wire as it
+comes off.
 
 ```
 Thermostat wires                    Relay board screw terminals
@@ -83,31 +109,40 @@ Thermostat wires                    Relay board screw terminals
   Y  --------------------------- NO1   compressor (heat and cool)
   O/B ------------------------- NO2   reversing valve
   W2 --------------------------- NO3   aux heat strips
-  E  --------------------------- NO3   (same terminal as W2; see below)
+  E  --------------------------- NO3   (with W2, if E is a separate wire)
   G  --------------------------- NO4   blower
-  C  ------ not used (logic side is USB powered)
+  C  ------ not used, cap it (logic side is USB powered)
 ```
 
-**W2 and E.** On this air handler, W2 (second-stage / auxiliary heat) and E
-(emergency heat) both end up energising the strip heaters. If the old stat
-had a separate E wire, land it on NO3 with W2; if E was only a jumper on the
-old stat, there is nothing to land. The firmware's "Emergency Heat" switch
-runs the strips with the compressor off, which is what the EMER position
-did.
+The reversing valve is **O type** (energised to cool): metered 24 VAC
+between O/B and C during a cool call on the old stat (2026-09-12). The
+heat pump firmware assumes O. If heat ever blows cold, the valve logic is
+inverted; nothing breaks, but fix it before leaving it running.
 
-**O or B.** This system is **O type** (valve energised to cool): metered
-24 VAC between O/B and C during a cool call on the old thermostat. The
-firmware's "Reversing Valve" select defaults to O, so leave it. If the
-select is ever wrong, heat blows cold; nothing breaks, but fix it before
-leaving it running.
+**Conventional system.**
+
+```
+  R  ---+------------------------ COM1
+        +------------------------ COM2
+  W  --------------------------- NO1   heat
+  Y  --------------------------- NO2   cool
+  G  --------------------------- NO2   with Y, only if the blower needs it
+  C  ------ not used, cap it
+```
+
+Never land 24 VAC on the Dial's green 6 to 36 V terminal: it is DC only.
 
 ### Power
 
-Bench: USB-C into the Dial. Wall: the same. A 1 A wall wart is plenty; the
-four relay coils draw about 70 mA each. The Dial's 6 to 36 V DC terminal is
-an alternative if a DC supply is handier behind the wall plate. Whether the
-Grove 5 V rail is powered from the DC terminal input was not verifiable from
-M5Stack's docs, so confirm with a meter before relying on it.
+USB-C into the Dial, bench and wall. A 1 A supply is plenty (four relay
+coils at about 70 mA each plus the Dial).
+
+### Sensor placement
+
+The SCD40 reads high when it sits near the Dial and buck (bench: 74.8 °F
+drifting to 79.6 °F against a 75.2 °F reference). Mount it outside and
+below the enclosure with an air gap, then set `temperature_offset` against a
+reference thermometer once it is in its final position.
 
 ## 2. Remote units (CYD)
 
@@ -149,30 +184,28 @@ Do not use P3 for I2C: its GPIO21 is the backlight and GPIO35 is input only.
 
 ## 3. Bring-up order
 
-1. **Dial on the bench, nothing on PORT.A.** Flash over USB-C with a data
-   cable (a charge-only cable shows no USB device at all). Do not hold the
-   boot button under the back sticker; if you did, press reset afterwards or
-   the chip stays in download mode and the app never starts. Expect
-   "PCF8574 not available" and "bme680 marked as failed" in the log until
-   step 2. Confirm the screen, encoder, button and touch work and the device
-   appears in HA. Serial logs come out of the USB-C port; use
-   `esphome logs hestian-dial.yaml` after pressing reset if it shows nothing.
-2. **Add the BME680 and PCF8574.** Check the boot log's I2C scan shows both
-   addresses. Confirm "Hallway Temperature" reads sanely in HA.
-3. **Add the relay board (logic side only).** From the HA device page toggle
-   Relay Compressor / Reversing Valve / Aux Heat / Fan. Each relay should
-   click and its LED light. Verify
-   COM to NO continuity on the energised relay with a meter.
-4. **Exercise the thermostat on the bench.** Set the heat setpoint above room
-   temperature in heat_cool mode and watch the heat relay close after the
-   idle timer. Lower it and watch it open after the min run time.
-5. **Wall install.** Air handler off. Move the thermostat wires to the relay
-   board per the 24 VAC diagram. Set "Reversing Valve" in HA for the brand.
-   Power up. Call for fan first (lowest risk), then cool (outdoor unit runs,
-   cold air at the registers), then heat (warm air; if it blows cold, flip
-   the Reversing Valve select), then Emergency Heat (strips only, outdoor
-   unit stays off).
-6. **Tune** the deadbands and cycle timers from the HA device page.
-7. **Remotes.** Flash, confirm sensors in HA, enable "Allow the device to
+1. **Dial on the bench.** Flash over USB-C with a data cable. Add
+   `hestian_api_key` (`openssl rand -base64 32`) and `hestian_ota_password`
+   to `secrets.yaml`. Confirm screen, knob and button, and adopt it in HA.
+2. **Buck and SCD40.** Set the buck to 3.3 V on a meter first. The boot
+   log's I2C scan should show 0x62. "SCL is held low" or "Found no devices"
+   means no pull-ups or swapped SDA/SCL.
+3. **MCP23017 and relay board (logic side only).** The scan should show the
+   expander's address; set it in the firmware. Relays are internal to the
+   thermostat, so test them through modes, and expect the 5 minute startup
+   delay after every flash:
+   - Heat, setpoint a little above room temp: Y and G click on.
+   - Heat, setpoint 5 °F or more above room temp: W2 joins (aux).
+   - Emergency Heat on in HA during a heat call: Y drops, W2 and G on.
+   - Cool, setpoint below room temp: O/B, Y and G on.
+   - Off: everything releases, including O/B.
+   Meter COM to NO on each energised relay.
+4. **Wall install.** Air handler off. Move the wires per the 24 VAC diagram.
+   Power up. Test cool (outdoor unit runs, cold air), then heat (warm air;
+   if cold, the valve logic is inverted), then Emergency Heat (strips only,
+   outdoor unit off).
+5. **Calibrate and tune.** Temperature offset against a reference, then
+   deadbands and cycle timers if needed.
+6. **Remotes.** Flash, confirm sensors in HA, enable "Allow the device to
    perform Home Assistant actions" on each remote in the ESPHome integration,
    then test a setpoint change from each screen.

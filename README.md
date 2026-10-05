@@ -7,10 +7,12 @@ of the hearth.
 ## What it is
 
 - **Wall thermostat:** an M5Stack Dial (ESP32-S3, round touchscreen, rotary
-  ring). It runs the thermostat logic itself, reads room temperature from a
-  BME680, and switches the compressor, reversing valve, aux heat strips and
-  blower through an opto-isolated relay board via a PCF8574 I2C expander. Twist the ring to move a setpoint, press to
-  switch between the heat and cool setpoints, long-press to change mode.
+  ring). It runs the thermostat logic itself (and keeps running if HA or
+  WiFi is down), reads room temperature from an SCD40, and switches the
+  compressor, reversing valve, aux heat strips and blower through an
+  opto-isolated relay board via an MCP23017 I2C expander. Twist the ring to
+  move the active setpoint in Heat or Cool mode; press for a menu (mode,
+  setpoints, brightness). A conventional W/Y variant is included too.
 - **Two remote units:** Cheap Yellow Displays (ESP32-2432S028R, 2-USB) with an
   SCD40 and a BME680 each. Each shows the thermostat's temperature, mode and
   both setpoints with +/- buttons, plus the local room's temperature,
@@ -24,8 +26,10 @@ of the hearth.
 ## Repository layout
 
 ```
-esphome/                ESPHome firmware (validated and compiled with 2026.4.3)
-  hestian-dial.yaml       the thermostat
+esphome/                ESPHome firmware
+  hestian-dial-heatpump.yaml      the thermostat, heat pump + aux (this apartment)
+  hestian-dial-conventional.yaml  the thermostat, W heat + Y cool (bench tested)
+  hestian-dial-lvgl-draft.yaml    superseded 2026-09-12 draft, reference only
   hestian-remote-1.yaml   remote unit, living room
   hestian-remote-2.yaml   remote unit, bedroom
   packages/common.yaml    shared wifi / api / ota / diagnostics
@@ -45,7 +49,7 @@ homeassistant/
 ```bash
 cd esphome
 cp secrets.yaml.example secrets.yaml   # fill in wifi, api key, ota password
-esphome run hestian-dial.yaml          # first flash over USB-C
+esphome run hestian-dial-heatpump.yaml # first flash over USB-C
 esphome run hestian-remote-1.yaml
 esphome run hestian-remote-2.yaml
 ```
@@ -58,7 +62,7 @@ remotes to call actions.
 
 | Unit | Board | Sensors | Other |
 |---|---|---|---|
-| Thermostat | M5Stack Dial v1.1 | BME680 (heater off) on Grove PORT.A | PCF8574 expander, 4-ch 5 V relay board, USB-C supply |
+| Thermostat | M5Stack Dial v1.1 | SCD40 on Grove PORT.A via a 3.3 V buck | MCP23017 expander, 4-ch 5 V relay board (H trigger), USB-C supply |
 | Remote x2 | ESP32-2432S028R (2-USB CYD) | SCD40 + BME680 on CN1 | on-board 2.8" touch display |
 
 The relays only switch the 24 VAC that comes from the air handler's own
@@ -66,8 +70,11 @@ transformer. All logic is USB powered, so there is no C-wire dependency.
 
 ## Status
 
-Firmware written, validated and compiled. Hardware bench test and wall
-install are next. Detailed phase tracking lives in the Obsidian vault
+2026-10-04: conventional Dial firmware bench tested end to end (sensor,
+heat/cool/auto, cycle protection, startup delay, interlock, knob and menu
+UI). The heat pump firmware is the same build with a four-relay MCP23017
+layer; it is validated and waiting on the expander for a bench test. Wall
+install follows. The CYD remote configs still assume the 2026-09-12 plan. Detailed phase tracking lives in the Obsidian vault
 (Hestian project folder).
 
 ## License

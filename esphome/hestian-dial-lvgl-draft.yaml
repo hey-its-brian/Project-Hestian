@@ -1,3 +1,11 @@
+# !! SUPERSEDED DRAFT (2026-10-05). Kept for reference, do not flash as-is.
+# !! Written 2026-09-12 before any hardware testing. Its hardware layer is
+# !! out of date: PORT.A pins are swapped (bench-tested: SDA GPIO15, SCL GPIO13),
+# !! it assumes a PCF8574 and BME680 (replaced by an MCP23017 and an SCD40).
+# !! Use hestian-dial-heatpump.yaml or hestian-dial-conventional.yaml instead.
+# !! Ideas worth porting later: LVGL UI, sensor-source select, HA tuning
+# !! entities, Emergency Heat behaviour, rtttl buzzer.
+#
 # Hestian: M5Stack Dial thermostat (the brain).
 #
 # Hardware (see docs/wiring.md):
